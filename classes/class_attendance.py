@@ -1,142 +1,121 @@
 import copy
 import logging
-import random
-from typing import Tuple
+import os.path
 
-import numpy as np
-from datetime import datetime
-import uuid
 import cv2
+import numpy as np
 import torch as torch
-from facenet_pytorch.models.mtcnn import MTCNN
+from torch import device
 
 from classes.camera_handler import CameraHandler
+from definitions import ROOT_DIR
 
 
 class ClassAttendance:
-    RELOAD_TIME = 0.5
-    THICKNESS = 2
-    MARGIN = -5
-    def __init__(self, gpu=True, data_model=None, fps=False, logger_level=logging.INFO):
+    DEFAULT_MODEL = os.path.join(ROOT_DIR, 'models', 'faces.pt')
+
+    def __init__(self, custom_data_model: str = None, force_reload: bool = False, logger_level=logging.INFO):
         """
 
-        :param gpu: use gpu or not
-        :param data_model: custom trained data_model
+        :param custom_data_model: a path to the custom data model.
+        :param force_reload: force reload the data model.
+        :param logger_level: the logging level of the program.
         """
+        # logger
         self.__set_logger_level(logger_level)
         self.__logger = logging.getLogger(self.__class__.__name__)
-        self.__data_model = data_model
-        self.__gpu: bool = gpu
-        self.__gpu_device = None
+        # processing device (gpu device if available)
+        self.__device = self.__get_device()
+        # data model
+        self.__custom_data_model_path = custom_data_model
+        self.__data_model = self.__init_data_model(force_reload)
+        # camera
         self.__camera = CameraHandler()
-        if self.__gpu:
-            self.__connect_to_gpu()
-        self.mtcnn = MTCNN(keep_all=True) if not self.__gpu_device else MTCNN(device=self.__gpu_device, keep_all=True)
-        self.__last_boxes = None
+        # store
         self.__timer = 0
-        self.__class_color = {'unknown': self.__random_color()}
-        self.__recognized_classes: set = set()
+        self.__frame = None
 
-    def __connect_to_gpu(self) -> None:
-        """ Getting GPU Device
+    def __get_device(self) -> device:
+        """ Getting GPU Device if available else CPU device
 
-        :return: None
+        :return: device
         """
         # connect to cuda device
         if torch.cuda.is_available():
-            self.__logger.debug('Connecting to cuda GPU !')
-            self.__gpu_device = torch.device('cuda')
-            return
+            self.__logger.debug('cuda GPU is available !')
+            return torch.device('cuda')
+        # TODO1 - connect to Apple m1 GPU device doesn't fully implemented yet.
+        # elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        #     self.__logger.debug('Apple silicon GPU is available !')
+        #     return torch.device("mps")
         else:
-            self.__logger.debug('cuda GPU is not available')
-        # TODO - Apple m1 GPU doesnt have implemented support yet. required code below
-        # # connect to Apple m1 GPU device
-        # if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        #     self.logger.debug('Apple m1 GPU is available !')
-        #     self.gpu_device = torch.device("mps")
-        # else:
-        #     self.logger.debug('Apple GPU is not available')
+            self.__logger.warning("could not connect to GPU device, works on CPU")
+            return torch.device("cpu")
+
+    def __init_data_model(self, force_reload: bool = False):
+        return torch.hub.load(
+            model='custom',
+            source="local",
+            repo_or_dir=os.path.join(ROOT_DIR, "yolov5"),
+            path=self.__custom_data_model_path if self.__custom_data_model_path else self.DEFAULT_MODEL,
+            force_reload=force_reload,
+            device=self.__device)
 
     @staticmethod
-    def __set_logger_level(logger_level):
+    def __set_logger_level(logger_level) -> None:
         logging.basicConfig(level=logger_level)
 
-    def start(self):
+    def start(self) -> None:
         """ Starts the camera frames gattering in a new thread
-        and every RELOAD_TIME sending the frame to the MTCNN pre-trained network for generally face detection.
-        the cv2 draw the returned boxes on the frames.
+        and every RELOAD_TIME sending the frame to the model for face detection.
 
         :return: None
         """
         self.__camera.start()
-        self.__timer = datetime.now()
         while 1:
-            frame = copy.deepcopy(self.__camera.frame)
-            new_time = datetime.now()
-            if (new_time - self.__timer).seconds > ClassAttendance.RELOAD_TIME:
-                self.__timer = new_time
-                self.__get_new_boxes(frame)
-
-            self.__draw_boxes(frame)
-            cv2.imshow('', frame)
+            self.__frame = copy.deepcopy(self.__camera.frame)
+            try:
+                self.__classification(self.__frame)
+            except Exception as e:
+                print(e)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
         cv2.destroyAllWindows()
         self.__camera.stop()
 
-    def __get_new_boxes(self, frame) -> None:
-        """ sending the frame to the mtcnn and gets the new boxes arrays.
+    def __classification(self, frame) -> None:
+        """ recognize the face in the picture, and draw the classification on the frame useing cv2. """
+        result = self.__data_model(frame)
+        new_img = result.render()
+        if new_img:
+            self.__last_frame = new_img
+        frame = np.squeeze(self.__last_frame)
+        self.__add_detections_on_frame(frame, result)
+        cv2.imshow("", frame)
 
-        :param frame: frame to work on
-        :return: None
-        """
-        boxes, prob = self.mtcnn.detect(frame)
-        if boxes is not None:
-            boxes = np.array(boxes).astype(int)
-
-        self.__last_boxes = boxes
-
-    def __draw_boxes(self, frame) -> None:
-        if self.__last_boxes is None:
-            return
-        for box in self.__last_boxes:
-            # cv2.imwrite('pics/'+uuid.uuid4().__str__()+'.jpg', frame[box[1]:box[0], box[3]:box[2]])
-            classification: str = self.__classification(box)
-            self._add_class_to_set(classification)
-            self.__set_box_label(box, classification, frame)
-            self.__draw_rectangle(box, classification, frame)
-
-    def __set_box_label(self, box, classification, frame):
-        cv2.putText(frame, classification, (box[0], box[1] + self.MARGIN), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                    self.__get_cls_color(classification), self.THICKNESS, cv2.LINE_AA)
-
-    def __draw_rectangle(self, box, classification, frame) -> None:
-        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]),
-                      self.__get_cls_color(classification), self.THICKNESS)
-
-    def __get_cls_color(self, classification: str):
-        return self.__class_color.get(classification, self.__random_color())
-
-    def __random_color(self) -> Tuple[int, int, int]:
-        return random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)
-
-    def __classification(self, box) -> str:
-        """ recognize the face in the picture and returns the name
-
-        :return: string -> face name.
-        """
-        cls = 'unknown'
-        if cls != 'unknown' and cls not in self.__class_color:
-            self.__class_color[cls] = self.__random_color()
-        return cls
-
-    def _add_class_to_set(self, classification: str) -> None:
-        self.__recognized_classes.add(classification)
+    @staticmethod
+    def __add_detections_on_frame(frame, result):
+        cv2.putText(frame, result.print(classes=True),
+                    (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    1,
+                    2)
+        # adding quit instruction.
+        cv2.putText(frame, "Press Q to quit",
+                    (10, frame.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    1,
+                    2)
 
 
 if __name__ == '__main__':
-    # attendance = ClassAttendance(logger_level=logging.DEBUG)
-    clas = ClassAttendance(logger_level=logging.DEBUG)
+    custom_model_path = os.path.join(ROOT_DIR, 'yolov5', 'runs', 'train', 'best.pt')
+    clas = ClassAttendance(logger_level=logging.DEBUG,
+                           custom_data_model=custom_model_path,
+                           force_reload=True)
     clas.start()
-
