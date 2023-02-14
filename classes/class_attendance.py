@@ -96,7 +96,7 @@ class ClassAttendance:
 
     @staticmethod
     def __add_detections_on_frame(frame, result):
-        cv2.putText(frame, result.print(classes=True),
+        cv2.putText(frame, result.print(classes=True).replace("face", "unknown"),
                     (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,
