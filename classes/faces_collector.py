@@ -54,7 +54,7 @@ def main():
     save_images_path = ds_images_path
     while counter < num_of_pics:
         # change saving location from the dataset to testing set after half of the num_of_pics
-        if counter == int(num_of_pics * 0.8):
+        if counter == int(num_of_pics * 0.7):
             save_labels_path = ts_labels_path
             save_images_path = ts_images_path
         frame = copy.deepcopy(camera.frame)
